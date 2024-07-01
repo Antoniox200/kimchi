@@ -32,8 +32,11 @@ class VADInterruptibleAIAssistant:
         self.is_listening = False
         self.is_speaking = False
         self.last_speech_time = time.time()
-        self.debounce_time = .75  # 750ms debounce time
+        self.debounce_time = 1  # 1000ms debounce time
         self.interrupted_speech = False
+        self.min_audio_length = 0.1  # 100ms minimum audio length for transcription
+        self.energy_threshold = 500  # Adjust based on your audio input
+        self.silence_threshold = 0.1  # 10% of frames can be silence
 
         self.text_output = tk.Text(master, height=20, width=50)
         self.text_output.pack()
@@ -195,6 +198,13 @@ class VADInterruptibleAIAssistant:
         self.is_speaking = False
         self.tts_event.set()  # Signal that we're ready for the next TTS
 
+    def is_silence(self, audio_segment):
+        return np.sqrt(np.mean(np.square(audio_segment))) < self.energy_threshold
+
+    def contains_speech(self, audio_frames):
+        silence_count = sum(1 for frame in audio_frames if self.is_silence(np.frombuffer(frame, dtype=np.int16)))
+        return (len(audio_frames) - silence_count) / len(audio_frames) > self.silence_threshold
+
     def process_audio(self, audio_frames):
         if not audio_frames:
             return
@@ -202,18 +212,25 @@ class VADInterruptibleAIAssistant:
         self.is_listening = False
         print("Processing audio frames.")
 
+        audio_length = len(audio_frames) * 10 / 1000  # in seconds
+        if audio_length < self.min_audio_length:
+            print("Audio too short for transcription: {audio_length} seconds.")
+            self.is_listening = True
+            return
+        
+        # Check if audio contains speech
+        if not self.contains_speech(audio_frames):
+            print("Audio doesn't contain enough speech.")
+            self.is_listening = True
+            return
+
+        # Write audio frames to WAV file
         wf = wave.open("temp.wav", "wb")
         wf.setnchannels(1)
         wf.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
         wf.setframerate(16000)
         wf.writeframes(b''.join(audio_frames))
         wf.close()
-
-        audio_length = len(audio_frames) * 10 / 1000  # in seconds
-        if audio_length < 0.1:
-            print("Audio too short for transcription.")
-            self.is_listening = True
-            return
 
         try:
             with open("temp.wav", "rb") as audio_file:
