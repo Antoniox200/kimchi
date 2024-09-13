@@ -128,7 +128,7 @@ class VADInterruptibleAIAssistant:
         self.debounce_time = 0.1  # Check for speech every 100ms
         self.min_silence_duration = 1.5  # Increased to 1.5 seconds to handle brief pauses
         self.interrupted_speech = False
-        self.min_speech_length = 1.0  # Minimum accumulated speech length for processing
+        self.min_speech_length = .2  # Minimum accumulated speech length for processing
 
         self.text_output = tk.Text(master, height=20, width=50)
         self.text_output.pack()
@@ -204,8 +204,8 @@ class VADInterruptibleAIAssistant:
                 self.vad_model,
                 sampling_rate=self.vad_samplerate,
                 threshold=0.5,
-                min_speech_duration_ms=250,
-                min_silence_duration_ms=500,
+                min_speech_duration_ms=100,  # Reduced from 250ms
+                min_silence_duration_ms=200,  # Reduced from 500ms
             )
 
             if speech_timestamps:
@@ -273,6 +273,8 @@ class VADInterruptibleAIAssistant:
 
     {context_text}
 
+    Now, a potential interruption has occurred.
+
     The user just said: "{transcribed_text}".
 
     Based on the conversation so far, is the user trying to interrupt the assistant with something relevant, or is it background noise or irrelevant speech?
@@ -282,7 +284,7 @@ class VADInterruptibleAIAssistant:
         print("Sending to helper GPT model for assessment.")
         try:
             response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": helper_prompt}]
             )
             assessment = response.choices[0].message.content.strip().lower()
