@@ -13,14 +13,7 @@ import collections
 import time
 import torch
 from scipy import signal
-
-# Install silero-vad if not already installed
-try:
-    from silero_vad import get_speech_timestamps, load_silero_vad
-except ImportError:
-    print("Installing silero-vad...")
-    os.system('pip install silero-vad')
-    from silero_vad import get_speech_timestamps, load_silero_vad
+from silero_vad import get_speech_timestamps, load_silero_vad
 
 # Initialize the OpenAI API (replace with your actual API key)
 client = OpenAI(api_key="sk-proj-oQpqMVR2jfkrJuWhzhjfT3BlbkFJd41WdvJe6qzW2SXO2dT9")  # Replace with your actual API key
