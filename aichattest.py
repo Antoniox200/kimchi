@@ -14,9 +14,11 @@ import time
 import torch
 from scipy import signal
 from silero_vad import get_speech_timestamps, load_silero_vad
+from vosk import Model as VoskModel, KaldiRecognizer
+import json
 
 # Initialize the OpenAI API (replace with your actual API key)
-client = OpenAI(api_key="sk-proj-oQpqMVR2jfkrJuWhzhjfT3BlbkFJd41WdvJe6qzW2SXO2dT9")  # Replace with your actual API key
+client = OpenAI(api_key='sk-proj-oQpqMVR2jfkrJuWhzhjfT3BlbkFJd41WdvJe6qzW2SXO2dT9')  # Replace with your actual API key
 
 class ConversationContext:
     def __init__(self):
@@ -115,13 +117,13 @@ class VADInterruptibleAIAssistant:
         master.title("VAD-enabled Interruptible AI Assistant")
 
         self.conversation_context = ConversationContext()
-        self.is_listening = False
+        self.is_listening = True
         self.is_speaking = False
         self.last_speech_time = time.time()
         self.debounce_time = 0.1  # Check for speech every 100ms
         self.min_silence_duration = 1.5  # Increased to 1.5 seconds to handle brief pauses
         self.interrupted_speech = False
-        self.min_speech_length = .2  # Minimum accumulated speech length for processing
+        self.min_speech_length = 0.2  # Minimum accumulated speech length for processing
 
         self.text_output = tk.Text(master, height=20, width=50)
         self.text_output.pack()
@@ -135,13 +137,18 @@ class VADInterruptibleAIAssistant:
         self.vad_samplerate = 16000
         self.window_size_samples = 512  # For 16kHz sampling rate
 
+        # Initialize Vosk Model
+        print("Loading Vosk model...")
+        self.vosk_model = VoskModel("models/vosk-model-small-en-us-0.15")  # Ensure this path is correct
+        self.recognizer = KaldiRecognizer(self.vosk_model, self.vad_samplerate)
+        self.recognizer.SetWords(True)
+
         self.audio_buffer = bytearray()
         self.buffer_lock = threading.Lock()
         self.processing_audio = False
 
-        self.speech_buffer = bytearray()
-        self.potential_interruption_buffer = bytearray()
-        self.in_potential_interruption = False
+        self.current_partial = ''
+        self.processing_partial = False
 
         self.streaming_tts = StreamingTTS()
         self.streaming_tts.start()
@@ -173,7 +180,7 @@ class VADInterruptibleAIAssistant:
         while True:
             time.sleep(0.1)  # Process every 100ms
             with self.buffer_lock:
-                if len(self.audio_buffer) >= self.vad_samplerate * 2 * 0.5:  # At least 0.5 seconds of audio
+                if len(self.audio_buffer) >= self.window_size_samples * 2:
                     audio_data = self.audio_buffer[:]
                     self.audio_buffer = bytearray()
                 else:
@@ -185,44 +192,49 @@ class VADInterruptibleAIAssistant:
             # Apply noise suppression
             audio_np = self.noise_suppression(audio_np)
 
-            # Convert to float32 and normalize
-            audio_float32 = audio_np.astype(np.float32) / 32768.0
+            # Convert to bytes for Vosk
+            audio_bytes = audio_np.tobytes()
 
-            # Convert to torch tensor
+            # Feed audio to Vosk recognizer
+            if self.recognizer.AcceptWaveform(audio_bytes):
+                result = json.loads(self.recognizer.Result())
+                text = result.get('text', '')
+                if text:
+                    print(f"Final transcription: {text}")
+                    self.handle_partial_transcription(text, partial=False)
+            else:
+                partial_result = json.loads(self.recognizer.PartialResult())
+                partial_text = partial_result.get('partial', '')
+                if partial_text:
+                    print(f"Partial transcription: {partial_text}")
+                    self.handle_partial_transcription(partial_text, partial=True)
+
+            # Use Silero VAD to detect speech activity
+            audio_float32 = audio_np.astype(np.float32) / 32768.0
             torch_audio = torch.from_numpy(audio_float32)
 
-            # Use get_speech_timestamps
             speech_timestamps = get_speech_timestamps(
                 torch_audio,
                 self.vad_model,
                 sampling_rate=self.vad_samplerate,
                 threshold=0.5,
-                min_speech_duration_ms=100,  # Reduced from 250ms
-                min_silence_duration_ms=200,  # Reduced from 500ms
+                min_speech_duration_ms=100,
+                min_silence_duration_ms=200,
             )
 
             if speech_timestamps:
-                print("Speech detected in buffer.")
                 self.last_speech_time = time.time()
-                # Extract speech segments and accumulate
-                for timestamp in speech_timestamps:
-                    start = timestamp['start']
-                    end = timestamp['end']
-                    start_byte = int(start * 2)  # Multiply by 2 because int16 (2 bytes)
-                    end_byte = int(end * 2)
-                    speech_segment = audio_data[start_byte:end_byte]
-                    self.speech_buffer.extend(speech_segment)
-                if self.streaming_tts.is_speaking:
-                    if not self.in_potential_interruption:
-                        self.start_potential_interruption()
-                    self.potential_interruption_buffer.extend(self.speech_buffer)
             else:
                 silence_duration = time.time() - self.last_speech_time
                 if silence_duration >= self.min_silence_duration and not self.processing_audio:
-                    print(f"Silence detected for {silence_duration:.2f} seconds. Processing audio.")
+                    print(f"Silence detected for {silence_duration:.2f} seconds. Processing final transcription.")
                     self.processing_audio = True
-                    threading.Thread(target=self.process_audio, args=(self.speech_buffer.copy(),), daemon=True).start()
-                    self.speech_buffer = bytearray()
+                    final_text = self.current_partial.strip()
+                    if final_text:
+                        self.process_user_input(final_text)
+                    self.current_partial = ''
+                    self.recognizer.Reset()
+                    self.processing_audio = False
 
     def noise_suppression(self, audio_frame):
         # Simple high-pass filter to remove low-frequency noise
@@ -230,74 +242,89 @@ class VADInterruptibleAIAssistant:
         filtered_audio = signal.lfilter(b, a, audio_frame)
         return filtered_audio.astype(np.int16)
 
-    def start_potential_interruption(self):
-        if not self.in_potential_interruption:
-            print("Starting potential interruption.")
-            self.in_potential_interruption = True
-            threading.Thread(target=self.confirm_interruption, daemon=True).start()
+    def handle_partial_transcription(self, text, partial=False):
+        if partial:
+            self.current_partial = text
+            if not self.processing_partial:
+                self.processing_partial = True
+                threading.Thread(target=self.analyze_partial_transcription, daemon=True).start()
+        else:
+            self.current_partial = text
 
-    def confirm_interruption(self):
-        time.sleep(1.0)  # Wait for more potential interruption data
-        if self.in_potential_interruption:
-            print("Confirming interruption.")
-            # Transcribe potential interruption buffer
-            transcribed_text = self.transcribe_audio(self.potential_interruption_buffer)
-            print(f"Transcribed interruption: {transcribed_text}")
+    def analyze_partial_transcription(self):
+        while self.processing_partial:
+            time.sleep(0.5)  # Check every 500ms
+            partial_text = self.current_partial.strip()
+            if partial_text:
+                # Use gpt-4o-mini to decide if the assistant should interrupt
+                recent_messages = self.conversation_context.get_messages()[-4:]  # Get the last 4 messages
+                context_text = ""
+                for msg in recent_messages:
+                    context_text += f"{msg['role']}: {msg['content']}\n"
 
-            if self.is_relevant_interruption(transcribed_text):
-                self.interrupt_speech()
-                self.process_user_input(transcribed_text)
+                helper_prompt = f"""Consider the following conversation:
+
+{context_text}
+
+Now, the user is currently speaking: "{partial_text}".
+
+Based on the conversation so far and what the user is currently saying, should the assistant interrupt the user to provide helpful information or correction?
+
+Please respond with only 'interrupt' or 'continue listening'. Do not include any explanations or additional text."""
+
+                print("Sending to helper GPT model for interruption decision.")
+                print("Partial transcription:", partial_text)
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": helper_prompt}]
+                    )
+                    decision = response.choices[0].message.content.strip().lower()
+                    print(f"Helper GPT decision: {decision}")
+                    if decision == 'interrupt':
+                        self.interrupt_user_speech()
+                        break
+                    else:
+                        print("Assistant decides to continue listening.")
+                except Exception as e:
+                    print(f"Helper GPT error during interruption check: {e}")
             else:
-                print("Interruption not relevant. Continuing TTS playback.")
-                self.in_potential_interruption = False
-                self.potential_interruption_buffer = bytearray()
+                print("No partial transcription available.")
+        self.processing_partial = False
 
-            self.in_potential_interruption = False
-            self.potential_interruption_buffer = bytearray()
+    def interrupt_user_speech(self):
+        if self.is_listening:
+            print("Assistant is interrupting the user.")
+            # Stop listening
+            self.is_listening = False
+            self.stream.stop_stream()
 
-    def is_relevant_interruption(self, transcribed_text):
-        # Include recent conversation context
-        recent_messages = self.conversation_context.get_messages()[-4:]  # Get the last 4 messages
-        context_text = ""
-        for msg in recent_messages:
-            context_text += f"{msg['role']}: {msg['content']}\n"
+            # Prepare the assistant's response
+            user_text = self.current_partial.strip()
+            if not user_text:
+                user_text = "<Unable to transcribe user's speech>"
 
-        helper_prompt = f"""Consider the following conversation:
+            self.conversation_context.add_message("user", user_text)
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=self.conversation_context.get_messages()
+                )
+                ai_response = response.choices[0].message.content
+                print(f"AI response: {ai_response}")
+                self.conversation_context.add_message("assistant", ai_response)
+                self.text_output.insert(tk.END, f"AI: {ai_response}\n")
 
-    {context_text}
+                self.streaming_tts.add_to_queue(ai_response)
+            except Exception as e:
+                print(f"ChatGPT API error during interruption: {e}")
 
-    Now, a potential interruption has occurred.
+            # Reset partial transcription
+            self.current_partial = ''
+            self.recognizer.Reset()
 
-    The user just said: "{transcribed_text}".
-
-    Based on the conversation so far, is the user trying to interrupt the assistant with something relevant, or is it background noise or irrelevant speech?
-
-    Please respond with only 'interrupt' or 'ignore'. Do not include any explanations or additional text."""
-
-        print("Sending to helper GPT model for assessment.")
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": helper_prompt}]
-            )
-            assessment = response.choices[0].message.content.strip().lower()
-            print(f"Helper GPT assessment: {assessment}")
-            if assessment == 'interrupt':
-                return True
-            else:
-                return False
-        except Exception as e:
-            print(f"Helper GPT error: {e}")
-            return False
-
-
-    def interrupt_speech(self):
-        if self.streaming_tts.is_speaking:
-            print("Interrupting speech.")
-            self.streaming_tts.stop_speaking()
-            self.is_speaking = False
-            self.interrupted_speech = True
-            self.text_output.insert(tk.END, "Speech interrupted.\n")
+            # Resume listening after speaking
+            threading.Thread(target=self.resume_listening_after_speech, daemon=True).start()
 
     def process_user_input(self, user_text):
         print(f"User text: {user_text}")
@@ -311,7 +338,7 @@ class VADInterruptibleAIAssistant:
 
         try:
             response = client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-4o",
                 messages=self.conversation_context.get_messages()
             )
             ai_response = response.choices[0].message.content
@@ -323,57 +350,12 @@ class VADInterruptibleAIAssistant:
         except Exception as e:
             print(f"ChatGPT API error: {e}")
 
-    def process_audio(self, audio_data):
-        if not audio_data:
-            self.processing_audio = False
-            return
-
-        print("Processing audio data.")
-
-        audio_length = len(audio_data) / (self.vad_samplerate * 2)  # in seconds
-        print(f"Audio length: {audio_length:.2f} seconds")
-        if audio_length < self.min_speech_length:
-            print(f"Accumulated speech too short for transcription: {audio_length:.2f} seconds.")
-            self.processing_audio = False
-            return
-
-        # Transcribe audio
-        transcribed_text = self.transcribe_audio(audio_data)
-        if not transcribed_text:
-            print("Transcription failed or empty.")
-            self.processing_audio = False
-            return
-
-        self.process_user_input(transcribed_text)
-        self.processing_audio = False
-
-    def transcribe_audio(self, audio_data):
-        # Write audio data to WAV file
-        wav_filename = "temp.wav"
-        try:
-            wf = wave.open(wav_filename, "wb")
-            wf.setnchannels(1)
-            wf.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(self.vad_samplerate)
-            wf.writeframes(audio_data)
-            wf.close()
-
-            # Transcribe audio using OpenAI Whisper API
-            with open(wav_filename, "rb") as audio_file:
-                print("Transcribing audio...")
-                transcript = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file
-                )
-            transcribed_text = transcript.text
-            print(f"Transcription result: {transcribed_text}")
-            return transcribed_text
-        except Exception as e:
-            print(f"Transcription error: {e}")
-            return None
-        finally:
-            if os.path.exists(wav_filename):
-                os.remove(wav_filename)
+    def resume_listening_after_speech(self):
+        self.streaming_tts.tts_event.wait()  # Wait until TTS is done
+        time.sleep(0.5)  # Slight delay before resuming
+        self.is_listening = True
+        self.start_listening()
+        print("Resumed listening after assistant's interruption.")
 
     def run(self):
         self.master.mainloop()
