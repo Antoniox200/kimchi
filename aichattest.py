@@ -16,7 +16,7 @@ from scipy import signal
 from silero_vad import get_speech_timestamps, load_silero_vad
 
 # Initialize the OpenAI API (replace with your actual API key)
-client = OpenAI(api_key="sk-proj-oQpqMVR2jfkrJuWhzhjfT3BlbkFJd41WdvJe6qzW2SXO2dT9")  # Replace with your actual API key
+client = OpenAI(api_key="replace with your actual API key")  # Replace with your actual API key
 
 class ConversationContext:
     def __init__(self):
